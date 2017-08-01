@@ -42,8 +42,8 @@ import picard.cmdline.Option;
 import picard.cmdline.StandardOptionDefinitions;
 
 import java.io.File;
-import java.util.Arrays;
-import java.util.Collection;
+import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * Super class that is designed to provide some consistent structure between subclasses that
@@ -53,6 +53,7 @@ import java.util.Collection;
  * @author Tim Fennell
  */
 public abstract class SinglePassSamProgram extends CommandLineProgram {
+    private static final int MAX_PAIRS = 500;
     @Option(shortName = StandardOptionDefinitions.INPUT_SHORT_NAME, doc = "Input SAM or BAM file.")
     public File INPUT;
 
@@ -77,7 +78,67 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
         makeItSo(INPUT, REFERENCE_SEQUENCE, ASSUME_SORTED, STOP_AFTER, Arrays.asList(this));
         return 0;
     }
+    //added code----------------------------------------------------
+    static class Pair {
+        private SAMRecord record;
+        private ReferenceSequence reference;
 
+        public Pair(SAMRecord record, ReferenceSequence reference) {
+            this.record = record;
+            this.reference = reference;
+        }
+
+        public SAMRecord getRec(){
+            return record;
+        }
+
+        public ReferenceSequence getRef(){
+            return reference;
+        }
+    }
+
+    static class Worker implements Runnable{
+        private Semaphore full;
+        private Semaphore empty;
+        private Queue<List<Pair>> buffer;
+
+        private Collection<SinglePassSamProgram> programs;
+
+        List<Pair> PoisonPill = Collections.EMPTY_LIST;
+
+        Worker(Semaphore full, Semaphore empty, Queue<List<Pair>> buffer, Collection<SinglePassSamProgram> programs) {
+            this.full = full;
+            this.empty = empty;
+            this.buffer = buffer;
+            this.programs = programs;
+        }
+
+        @Override
+        public void run() {
+            while (true){
+                full.acquireUninterruptibly();
+
+                List<Pair> pairs = buffer.poll();
+                if(pairs == PoisonPill){
+                    return;
+                }
+
+                for(Pair pair:pairs){
+                    for (final SinglePassSamProgram program : programs) {
+                        program.acceptRead(pair.getRec(), pair.getRef());
+                    }
+                }
+
+                empty.release();
+            }
+        }
+        public void stop(){
+            empty.acquireUninterruptibly();
+            buffer.add(PoisonPill);
+            full.release();
+        }
+    }
+    //***-----------------------------------------------------------
     public static void makeItSo(final File input,
                                 final File referenceSequence,
                                 final boolean assumeSorted,
@@ -126,16 +187,27 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
 
         final ProgressLogger progress = new ProgressLogger(log);
 
+        //added code--------------------------------------------------
+        Queue<List<Pair>> buffer = new LinkedBlockingQueue<>();//очередь блоков
+        ExecutorService service = Executors.newSingleThreadExecutor();
+
+        Semaphore full = new Semaphore(0);
+        Semaphore empty = new Semaphore(100);//количество разрешений=количество мест в буфере
+
+        Worker worker = new Worker(full,empty,buffer,programs);
+        service.execute(worker);
+
+        List<Pair> pairs = new ArrayList<>(MAX_PAIRS);
+
+        int counter = 0;
+        //***----------------------------------------------------------
+
         for (final SAMRecord rec : in) {
             final ReferenceSequence ref;
             if (walker == null || rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                 ref = null;
             } else {
                 ref = walker.get(rec.getReferenceIndex());
-            }
-
-            for (final SinglePassSamProgram program : programs) {
-                program.acceptRead(rec, ref);
             }
 
             progress.record(rec);
@@ -149,7 +221,38 @@ public abstract class SinglePassSamProgram extends CommandLineProgram {
             if (!anyUseNoRefReads && rec.getReferenceIndex() == SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX) {
                 break;
             }
+            //added code-----------------------------------------------
+
+            Pair pair = new Pair(rec,ref);
+            pairs.add(pair);
+            counter++;
+
+            if (counter > MAX_PAIRS) {
+                empty.acquireUninterruptibly();
+                buffer.add(pairs);//добавить новый блок в очередь
+                full.release();
+                pairs = new ArrayList<>(MAX_PAIRS);//новый блок
+                counter = 0;
+            }
+            //***------------------------------------------------------
+
         }
+
+        //added code--------------------------------------
+        if (counter > 0) {
+            empty.acquireUninterruptibly();
+            buffer.add(pairs);//добавить последний блок в очередь
+            full.release();
+        }
+
+        service.shutdown();
+        worker.stop();
+        try {
+            service.awaitTermination(1, TimeUnit.DAYS);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        //***---------------------------------------------
 
         CloserUtil.close(in);
 
